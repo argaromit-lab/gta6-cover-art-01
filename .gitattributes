@@ -1,0 +1,2 @@
+# Preserve exact recorded source bytes including CRLF across platforms
+* -text

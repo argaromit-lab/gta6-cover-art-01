@@ -74,17 +74,28 @@ export function validateMagicBytes(bytes, mime) {
 }
 
 /**
- * Validates a data URL for allowed image types, magic bytes, and size caps.
+ * Validates a data URL for allowed image types, magic bytes, canonical base64, and size caps.
  */
 export function validateDataUrl(dataUrl) {
   if (typeof dataUrl !== 'string') return { valid: false, error: 'Not a string' };
-  if (dataUrl.includes('svg') || dataUrl.includes('javascript:') || dataUrl.startsWith('http://') || dataUrl.startsWith('https://')) {
-    return { valid: false, error: 'SVG, script, or external network references are forbidden' };
-  }
   const match = dataUrl.match(/^data:(image\/(jpeg|png|webp));base64,(.+)$/i);
   if (!match) return { valid: false, error: 'Invalid data URL format or unsupported MIME type' };
   const mime = match[1].toLowerCase();
+  if (mime.includes('svg') || mime === 'image/svg+xml') {
+    return { valid: false, error: 'SVG references are forbidden' };
+  }
   const base64Data = match[3];
+
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
+    return { valid: false, error: 'Invalid base64 characters' };
+  }
+  if (base64Data.length % 4 !== 0) {
+    return { valid: false, error: 'Invalid base64 padding or length' };
+  }
+  const maxBase64Len = Math.ceil(MAX_PHOTO_BYTES / 3) * 4;
+  if (base64Data.length > maxBase64Len) {
+    return { valid: false, error: 'Base64 data exceeds maximum size limit' };
+  }
 
   let bytes;
   try {
@@ -116,8 +127,11 @@ export function sanitizeFilename(name, prefix = 'coastline-project') {
  * Serializes project state and photos into a schema-v2 portable JSON bundle string.
  */
 export async function serializeProject(state, photos) {
+  if (!Array.isArray(photos) || photos.length === 0 || photos.length > MAX_PHOTOS) {
+    throw new Error('Invalid photos array count (max 36)');
+  }
   const validatedState = validateState(state, photos.length);
-  const assetMap = new Map(); // hash -> { hash, mime, data }
+  const assetMap = new Map();
   const photoEntries = [];
 
   for (const p of photos) {
@@ -125,15 +139,26 @@ export async function serializeProject(state, photos) {
     if (p.bytes && p.mime) {
       bytes = p.bytes;
       mime = p.mime;
-    } else {
+      if (bytes.length > MAX_PHOTO_BYTES) throw new Error('Photo exceeds maximum size limit (10 MB)');
+      const val = validateMagicBytes(bytes, mime);
+      if (!val.valid) throw new Error(`Asset magic validation failed: ${val.error}`);
+    } else if (p.image) {
+      const width = p.image.naturalWidth || p.image.width || 0;
+      const height = p.image.naturalHeight || p.image.height || 0;
+      if (!width || !height || width > MAX_DIMENSION || height > MAX_DIMENSION || (width * height) > MAX_PIXELS) {
+        throw new Error('Image dimensions exceed allowed limits');
+      }
       const c = document.createElement('canvas');
-      c.width = p.image.naturalWidth || p.image.width || 800;
-      c.height = p.image.naturalHeight || p.image.height || 600;
+      c.width = width;
+      c.height = height;
       c.getContext('2d').drawImage(p.image, 0, 0);
       const dataUrl = c.toDataURL('image/png');
       const val = validateDataUrl(dataUrl);
+      if (!val.valid) throw new Error(`Data URL validation failed: ${val.error}`);
       mime = val.mime;
       bytes = base64ToUint8Array(dataUrl.split(',')[1]);
+    } else {
+      throw new Error('Invalid photo object');
     }
 
     const hash = await computeSha256(bytes);
@@ -151,6 +176,10 @@ export async function serializeProject(state, photos) {
       name,
       hash
     });
+  }
+
+  if (assetMap.size > MAX_PHOTOS || photoEntries.length > MAX_PHOTOS) {
+    throw new Error('Too many assets or photos (max 36)');
   }
 
   const bundle = {
@@ -191,11 +220,15 @@ export async function importProjectJson(jsonText) {
       return { success: false, error: 'Invalid JSON format' };
     }
 
-    if (!project || typeof project !== 'object') {
+    if (!project || typeof project !== 'object' || Array.isArray(project)) {
       return { success: false, error: 'Project root must be an object' };
     }
 
-    const version = Number(project.version) || 1;
+    const version = project.version;
+    if (typeof version !== 'number' || (version !== 1 && version !== 2)) {
+      return { success: false, error: `Unsupported project version: ${version}` };
+    }
+
     const decodedPhotos = [];
 
     if (version === 2) {
@@ -205,18 +238,34 @@ export async function importProjectJson(jsonText) {
       if (!Array.isArray(project.photos) || project.photos.length === 0 || project.photos.length > MAX_PHOTOS) {
         return { success: false, error: 'Invalid photo count in bundle' };
       }
-      if (!Array.isArray(project.assets) || project.assets.length === 0) {
-        return { success: false, error: 'Missing or empty assets list in bundle' };
+      if (!Array.isArray(project.assets) || project.assets.length === 0 || project.assets.length > MAX_PHOTOS) {
+        return { success: false, error: 'Missing or empty or oversized assets list in bundle' };
       }
-      if (!project.state || typeof project.state !== 'object') {
+      if (!project.state || typeof project.state !== 'object' || Array.isArray(project.state)) {
         return { success: false, error: 'Missing or invalid project state' };
       }
 
+      // Validate state against photo count BEFORE decoding images
+      const validatedState = validateState(project.state, project.photos.length);
+
       const assetMap = new Map();
+      const seenAssetHashes = new Set();
       for (const asset of project.assets) {
         if (!asset || typeof asset.hash !== 'string' || typeof asset.data !== 'string' || typeof asset.mime !== 'string') {
           throw new Error('Malformed asset entry in bundle');
         }
+        if (!/^[a-f0-9]{64}$/i.test(asset.hash)) {
+          throw new Error('Invalid SHA256 hash format in asset');
+        }
+        if (seenAssetHashes.has(asset.hash)) {
+          throw new Error('Duplicate asset hash in bundle');
+        }
+        seenAssetHashes.add(asset.hash);
+
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(asset.data) || asset.data.length % 4 !== 0) {
+          throw new Error('Invalid asset base64 encoding');
+        }
+
         let bytes;
         try {
           bytes = base64ToUint8Array(asset.data);
@@ -237,25 +286,39 @@ export async function importProjectJson(jsonText) {
         assetMap.set(asset.hash, { bytes, mime: val.mime });
       }
 
+      const referencedHashes = new Set();
       for (const p of project.photos) {
         if (!p || typeof p.name !== 'string' || typeof p.hash !== 'string') {
           throw new Error('Malformed photo entry in bundle');
         }
-        const asset = assetMap.get(p.hash);
-        if (!asset) {
+        if (!assetMap.has(p.hash)) {
           throw new Error('Photo references missing asset hash');
         }
+        referencedHashes.add(p.hash);
+      }
 
+      for (const hash of assetMap.keys()) {
+        if (!referencedHashes.has(hash)) {
+          throw new Error('Unused asset found in bundle');
+        }
+      }
+
+      for (const p of project.photos) {
+        const asset = assetMap.get(p.hash);
         const blob = new Blob([asset.bytes], { type: asset.mime });
         const src = URL.createObjectURL(blob);
         objectUrlsToRevoke.push(src);
 
         const image = new Image();
-        await new Promise((resolve, reject) => {
-          image.onload = () => resolve();
-          image.onerror = () => reject(new Error('Failed to decode image asset'));
-          image.src = src;
-        });
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Image decode timed out')), 10000));
+        await Promise.race([
+          new Promise((resolve, reject) => {
+            image.onload = () => resolve();
+            image.onerror = () => reject(new Error('Failed to decode image asset'));
+            image.src = src;
+          }),
+          timeoutPromise
+        ]);
 
         const width = image.naturalWidth || image.width;
         const height = image.naturalHeight || image.height;
@@ -271,17 +334,17 @@ export async function importProjectJson(jsonText) {
         });
       }
 
-      const validatedState = validateState(project.state, decodedPhotos.length);
       return { success: true, state: validatedState, photos: decodedPhotos };
 
     } else if (version === 1) {
-      // Legacy version 1 support
       if (!Array.isArray(project.photos) || project.photos.length === 0 || project.photos.length > MAX_PHOTOS) {
         return { success: false, error: 'Invalid photo count in project' };
       }
-      if (!project.state || typeof project.state !== 'object') {
+      if (!project.state || typeof project.state !== 'object' || Array.isArray(project.state)) {
         return { success: false, error: 'Missing or invalid project state' };
       }
+
+      const validatedState = validateState(project.state, project.photos.length);
 
       for (const p of project.photos) {
         if (!p || typeof p.dataUrl !== 'string') {
@@ -298,11 +361,15 @@ export async function importProjectJson(jsonText) {
         objectUrlsToRevoke.push(src);
 
         const image = new Image();
-        await new Promise((resolve, reject) => {
-          image.onload = () => resolve();
-          image.onerror = () => reject(new Error('Failed to load image from data URL'));
-          image.src = src;
-        });
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Image decode timed out')), 10000));
+        await Promise.race([
+          new Promise((resolve, reject) => {
+            image.onload = () => resolve();
+            image.onerror = () => reject(new Error('Failed to load image from data URL'));
+            image.src = src;
+          }),
+          timeoutPromise
+        ]);
 
         const width = image.naturalWidth || image.width;
         const height = image.naturalHeight || image.height;
@@ -318,7 +385,6 @@ export async function importProjectJson(jsonText) {
         });
       }
 
-      const validatedState = validateState(project.state, decodedPhotos.length);
       return { success: true, state: validatedState, photos: decodedPhotos };
 
     } else {
@@ -326,7 +392,6 @@ export async function importProjectJson(jsonText) {
     }
 
   } catch (err) {
-    // Revoke object URLs on failure
     for (const url of objectUrlsToRevoke) {
       try { URL.revokeObjectURL(url); } catch (e) {}
     }
