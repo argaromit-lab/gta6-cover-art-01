@@ -1,11 +1,14 @@
 import { sizes, clamp, cropBounds, panelBox, panelPath, panelShapes, paintPoster } from './poster.js';
+import { defaultState, validateState, createHistoryStore, freshCrop } from './project-state.js';
+import { serializeProject, importProjectJson, sanitizeFilename } from './project-archive.js';
+import { calculateZoom, clampCropOffsets, calculatePointerPan, calculateKeyboardPan } from './crop-geometry.js';
+import { createShortcutManager } from './editor-shortcuts.js';
 
 const byId = id => document.getElementById(id);
 const canvas = byId('cover');
 const ctx = canvas.getContext('2d', { alpha: false });
 const photos = [];
-const undo = [];
-const redo = [];
+const historyStore = createHistoryStore(defaultState());
 const fields = ['caption', 'subtitle', 'type', 'typeScale', 'layout', 'intensity'];
 const samples = [
   ['boulevard', 'Boulevard'],
@@ -16,41 +19,18 @@ const samples = [
   ['skyline', 'Skyline'],
 ];
 
-const freshCrop = (photo, label = '') => ({ photo, x: 0, y: 0, z: 1, label });
 let editing = null;
 let selected = 0;
-let pointerDrag;
+let pointerDrag = null;
 let frame = 0;
 let ready = false;
 let exporting = false;
 let uploads = Promise.resolve();
-let state = {
-  size: 'landscape', layout: 'coast', grade: 'sunset', intensity: 74,
-  caption: 'Salt & Static', subtitle: 'The coast after dark',
-  type: 'marquee', typeScale: 100,
-  showLabels: false,
-  crops: Array.from({ length: 6 }, (_, i) => freshCrop(i, samples[i]?.[1] || `Panel ${i + 1}`)),
-};
+let wheelTimer = null;
 
-function checkpoint(snapshot = structuredClone(state)) {
-  undo.push(snapshot);
-  if (undo.length > 60) undo.shift();
-  redo.length = 0;
-}
-
-function applyChange(update) {
+function applyChange(updater, coalesceKey = null) {
   editing = null;
-  const before = structuredClone(state);
-  update();
-  if (JSON.stringify(before) !== JSON.stringify(state)) checkpoint(before);
-  refresh();
-}
-
-function travel(from, to) {
-  if (!from.length) return;
-  editing = null;
-  to.push(state);
-  state = from.pop();
+  historyStore.commit(updater, coalesceKey);
   refresh();
 }
 
@@ -58,7 +38,7 @@ function queueRender() {
   if (frame) return;
   frame = requestAnimationFrame(() => {
     frame = 0;
-    paintPoster(canvas, state, photos);
+    paintPoster(canvas, historyStore.getState(), photos);
   });
 }
 
@@ -70,6 +50,7 @@ function setPanelCount(count) {
   }
   for (let i = row.children.length; i < count; i += 1) {
     const button = document.createElement('button');
+    button.type = 'button';
     button.textContent = `Panel ${i + 1}`;
     button.addEventListener('click', () => selectPanel(i));
     row.append(button);
@@ -77,14 +58,16 @@ function setPanelCount(count) {
 }
 
 function refresh() {
+  const state = historyStore.getState();
   const points = panelShapes(state);
   const [width, height] = sizes[state.size];
   selected = Math.min(selected, points.length - 1);
-  const crop = state.crops[selected];
+  const crop = state.crops[selected] || freshCrop(0);
   setPanelCount(points.length);
 
   for (const id of fields) {
-    if (byId(id).value !== String(state[id])) byId(id).value = state[id];
+    const el = byId(id);
+    if (el && el.value !== String(state[id])) el.value = state[id];
   }
   byId('zoom').value = crop.z;
   byId('zoom-value').textContent = `${crop.z.toFixed(2)}×`;
@@ -92,8 +75,8 @@ function refresh() {
   byId('typeScale-value').textContent = `${state.typeScale}%`;
   byId('sceneLabel').value = crop.label ?? '';
   byId('showLabels').checked = !!state.showLabels;
-  byId('undo').disabled = !undo.length;
-  byId('redo').disabled = !redo.length;
+  byId('undo').disabled = !historyStore.canUndo();
+  byId('redo').disabled = !historyStore.canRedo();
   byId('export').disabled = !ready || exporting;
   byId('dimensions').textContent = `${width} × ${height} px`;
   byId('crop-label').textContent = `Panel ${selected + 1} zoom`;
@@ -119,13 +102,6 @@ function selectPanel(index) {
   refresh();
 }
 
-async function readPhoto(src, name) {
-  const image = new Image();
-  image.src = src;
-  await image.decode();
-  return { image, name };
-}
-
 function addPhoto(photo) {
   const index = photos.length;
   const button = document.createElement('button');
@@ -138,7 +114,9 @@ function addPhoto(photo) {
   label.textContent = photo.name;
   button.append(thumb, label);
   button.addEventListener('click', () => {
-    applyChange(() => { state.crops[selected] = freshCrop(index, photo.name.replace(/\.[^.]+$/, '') || 'Photo'); });
+    applyChange(state => {
+      state.crops[selected].photo = index;
+    });
   });
   byId('photos').append(button);
   photos.push({ ...photo, button });
@@ -149,62 +127,79 @@ async function addFiles(files) {
   const startingPanel = selected;
   let skipped = 0;
   for (const file of files) {
-    if ((file.type && !file.type.startsWith('image/')) || file.size > 30 * 1024 * 1024 || photos.length + decoded.length >= 36) {
+    if ((file.type && !file.type.startsWith('image/')) || file.size > 10 * 1024 * 1024 || photos.length + decoded.length >= 36) {
       skipped += 1;
       continue;
     }
-    const src = URL.createObjectURL(file);
     try {
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      const mime = file.type || 'image/jpeg';
+      const blob = new Blob([bytes], { type: mime });
+      const src = URL.createObjectURL(blob);
       const name = file.name.replace(/\.[^.]+$/, '') || 'New photo';
-      const p = await readPhoto(src, name);
-      decoded.push(p);
+      const image = new Image();
+      await new Promise((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error('Failed to load image'));
+        image.src = src;
+      });
+      decoded.push({ image, name, bytes, mime });
     } catch {
       skipped += 1;
-      URL.revokeObjectURL(src);
     }
   }
   if (decoded.length) {
     const start = photos.length;
     decoded.forEach(addPhoto);
-    applyChange(() => {
+    applyChange(state => {
       const count = panelShapes(state).length;
       const panel = Math.min(startingPanel, count - 1);
       decoded.forEach((p, i) => {
-        state.crops[(panel + i) % count] = freshCrop(start + i, p.name.replace(/\.[^.]+$/, '') || 'Photo');
+        const targetIndex = (panel + i) % count;
+        if (!state.crops[targetIndex]) {
+          state.crops[targetIndex] = freshCrop(start + i, p.name.replace(/\.[^.]+$/, '') || 'Photo');
+        } else {
+          state.crops[targetIndex].photo = start + i;
+        }
       });
     });
     decoded[0] && photos[start].button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
   const message = decoded.length ? `Added ${decoded.length} ${decoded.length === 1 ? 'photo' : 'photos'}.` : '';
-  const failure = skipped ? ` ${skipped} skipped. Try a JPG, PNG or WebP under 30 MB. The shelf holds 36 photos.` : '';
+  const failure = skipped ? ` ${skipped} skipped. Try a JPG, PNG or WebP under 10 MB. The shelf holds 36 photos.` : '';
   byId('status').textContent = (message + failure).trim();
 }
 
 byId('sceneLabel').addEventListener('input', () => {
-  changeContinuous('sceneLabel', () => {
-    state.crops[selected].label = byId('sceneLabel').value;
-  });
+  applyChange(state => {
+    if (state.crops[selected]) {
+      state.crops[selected].label = byId('sceneLabel').value;
+    }
+  }, 'sceneLabel');
 });
-byId('sceneLabel').addEventListener('blur', () => { editing = null; });
+byId('sceneLabel').addEventListener('blur', () => { editing = null; historyStore.endCoalesce(); });
 
 byId('showLabels').addEventListener('change', () => {
-  applyChange(() => {
+  applyChange(state => {
     state.showLabels = byId('showLabels').checked;
   });
 });
 
 byId('fill-all').addEventListener('click', () => {
-  applyChange(() => {
+  applyChange(state => {
     const activeCount = panelShapes(state).length;
     const source = state.crops[selected];
-    for (let i = 0; i < activeCount; i++) {
-      state.crops[i] = { ...source };
+    if (source) {
+      for (let i = 0; i < activeCount; i++) {
+        state.crops[i] = structuredClone(source);
+      }
     }
   });
 });
 
 byId('clear-lettering').addEventListener('click', () => {
-  applyChange(() => {
+  applyChange(state => {
     state.caption = '';
     state.subtitle = '';
   });
@@ -218,36 +213,37 @@ function enqueueFiles(files) {
   });
 }
 
-function changeContinuous(id, update) {
-  if (editing !== id) {
-    checkpoint();
-    editing = id;
-  }
-  update();
-  refresh();
-}
-
 fields.forEach(id => {
   const field = byId(id);
+  if (!field) return;
   const continuous = field.matches('[type="text"], [type="range"]');
-  field.addEventListener(continuous ? 'input' : 'change', () => {
+  field.addEventListener(continuous ? 'input' : 'change', event => {
     const value = field.type === 'range' ? Number(field.value) : field.value;
-    const write = () => { state[id] = value; };
-    if (continuous) changeContinuous(id, write);
-    else applyChange(write);
+    const write = state => { state[id] = value; };
+    if (continuous) {
+      applyChange(write, id);
+    } else {
+      applyChange(write);
+    }
   });
-  field.addEventListener('blur', () => { editing = null; });
-  if (field.type === 'range') field.addEventListener('change', () => { editing = null; });
+  field.addEventListener('blur', () => { editing = null; historyStore.endCoalesce(); });
+  if (field.type === 'range') {
+    field.addEventListener('change', () => { editing = null; historyStore.endCoalesce(); });
+  }
 });
 
 document.querySelectorAll('button[data-size], button[data-grade]').forEach(button => {
   button.addEventListener('click', () => {
-    applyChange(() => { Object.assign(state, button.dataset); });
+    applyChange(state => {
+      Object.assign(state, button.dataset);
+    });
   });
 });
 
 function activeCropBounds() {
+  const state = historyStore.getState();
   const crop = state.crops[selected];
+  if (!crop) return null;
   const photo = photos[crop.photo];
   if (!photo) return null;
   const [width, height] = sizes[state.size];
@@ -256,26 +252,96 @@ function activeCropBounds() {
 }
 
 function setZoom(value) {
-  const crop = state.crops[selected];
-  crop.z = Math.round(clamp(value, 1, 3) * 100) / 100;
-  const bounds = activeCropBounds();
-  if (!bounds) return;
-  crop.x = clamp(crop.x, -bounds.mx, bounds.mx);
-  crop.y = clamp(crop.y, -bounds.my, bounds.my);
+  applyChange(state => {
+    const crop = state.crops[selected];
+    if (!crop) return;
+    crop.z = calculateZoom(value);
+    const photo = photos[crop.photo];
+    if (!photo) return;
+    const [width, height] = sizes[state.size];
+    const box = panelBox(panelShapes(state)[selected], width, height);
+    const cb = cropBounds(photo.image, box, crop);
+    const clamped = clampCropOffsets(crop.x, crop.y, cb.mx, cb.my);
+    crop.x = clamped.x;
+    crop.y = clamped.y;
+  }, 'zoom');
 }
 
-byId('zoom').addEventListener('input', () => changeContinuous('zoom', () => setZoom(Number(byId('zoom').value))));
-byId('zoom').addEventListener('change', () => { editing = null; });
-byId('zoom').addEventListener('blur', () => { editing = null; });
-byId('reset').addEventListener('click', () => applyChange(() => {
-  state.crops[selected] = freshCrop(state.crops[selected].photo);
+byId('zoom').addEventListener('input', () => setZoom(Number(byId('zoom').value)));
+byId('zoom').addEventListener('change', () => { historyStore.endCoalesce(); });
+byId('zoom').addEventListener('blur', () => { historyStore.endCoalesce(); });
+
+byId('reset').addEventListener('click', () => applyChange(state => {
+  if (state.crops[selected]) {
+    state.crops[selected] = freshCrop(state.crops[selected].photo, state.crops[selected].label);
+  }
 }));
-byId('undo').addEventListener('click', () => travel(undo, redo));
-byId('redo').addEventListener('click', () => travel(redo, undo));
+
+byId('undo').addEventListener('click', () => {
+  historyStore.undo();
+  refresh();
+});
+byId('redo').addEventListener('click', () => {
+  historyStore.redo();
+  refresh();
+});
+
 byId('add-photo').addEventListener('click', () => byId('upload').click());
 byId('upload').addEventListener('change', event => {
   enqueueFiles(Array.from(event.target.files));
   event.target.value = '';
+});
+
+// Project Save / Open handlers using project-bundle.js
+byId('save-project').addEventListener('click', async () => {
+  try {
+    const state = historyStore.getState();
+    const json = await serializeProject(state, photos);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = sanitizeFilename(state.caption || 'project');
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    byId('status').textContent = 'Project saved. Photos stay on your device and project JSON contains them.';
+  } catch (err) {
+    byId('status').textContent = 'Could not save project.';
+  }
+});
+
+byId('open-project').addEventListener('click', () => {
+  byId('import-project').click();
+});
+
+byId('import-project').addEventListener('change', async event => {
+  const file = event.target.files?.[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > 40 * 1024 * 1024) {
+    byId('status').textContent = 'Could not open project. File exceeds 40 MB limit.';
+    return;
+  }
+  try {
+    byId('status').textContent = 'Opening project…';
+    const text = await file.text();
+    const result = await importProjectJson(text);
+    if (!result.success) {
+      throw new Error(result.error);
+    }
+
+    photos.forEach(p => {
+      if (p.button) p.button.remove();
+    });
+    photos.length = 0;
+    result.photos.forEach(p => addPhoto(p));
+    historyStore.reset(result.state);
+    selected = 0;
+    refresh();
+    byId('status').textContent = `Loaded project with ${result.photos.length} photos. Project recovery successful.`;
+  } catch (err) {
+    byId('status').textContent = `Could not open project: ${err.message || 'Invalid file or unsupported images'}. Prior project preserved.`;
+  }
 });
 
 let fileDragDepth = 0;
@@ -303,6 +369,7 @@ document.addEventListener('drop', event => {
 
 canvas.addEventListener('pointerdown', event => {
   if (!ready || !event.isPrimary || event.button !== 0) return;
+  const state = historyStore.getState();
   const rect = canvas.getBoundingClientRect();
   const x = (event.clientX - rect.left) * canvas.width / rect.width;
   const y = (event.clientY - rect.top) * canvas.height / rect.height;
@@ -328,73 +395,121 @@ canvas.addEventListener('pointermove', event => {
   const drag = pointerDrag;
   if (!drag || drag.id !== event.pointerId) return;
   const bounds = activeCropBounds();
-  const x = clamp(drag.cx + (event.clientX - drag.x) * drag.unitsX, -bounds.mx, bounds.mx);
-  const y = clamp(drag.cy + (event.clientY - drag.y) * drag.unitsY, -bounds.my, bounds.my);
+  if (!bounds) return;
+  const newOffsets = calculatePointerPan(drag, event, bounds);
+  const state = historyStore.getState();
   const crop = state.crops[selected];
-  if (x === crop.x && y === crop.y) return;
-  if (!drag.moved) checkpoint();
-  drag.moved = true;
-  Object.assign(crop, { x, y });
-  refresh();
-});
-canvas.addEventListener('lostpointercapture', () => { pointerDrag = null; });
+  if (!crop || (newOffsets.x === crop.x && newOffsets.y === crop.y)) return;
 
-let wheelTimer;
+  if (!drag.moved) {
+    historyStore.commit(s => s, 'pan');
+  }
+  drag.moved = true;
+  applyChange(s => {
+    const c = s.crops[selected];
+    if (c) {
+      c.x = newOffsets.x;
+      c.y = newOffsets.y;
+    }
+  }, 'pan');
+});
+
+canvas.addEventListener('lostpointercapture', () => {
+  if (pointerDrag && pointerDrag.moved) {
+    historyStore.endCoalesce();
+  }
+  pointerDrag = null;
+});
+
 canvas.addEventListener('wheel', event => {
   if (!ready || event.ctrlKey) return;
   event.preventDefault();
-  changeContinuous('wheel', () => setZoom(state.crops[selected].z - Math.sign(event.deltaY) * .06));
+  const state = historyStore.getState();
+  const crop = state.crops[selected];
+  if (!crop) return;
+  setZoom(crop.z - Math.sign(event.deltaY) * .06);
   clearTimeout(wheelTimer);
-  wheelTimer = setTimeout(() => { if (editing === 'wheel') editing = null; }, 230);
+  wheelTimer = setTimeout(() => { historyStore.endCoalesce(); }, 230);
 }, { passive: false });
 
-const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-canvas.addEventListener('keydown', event => {
-  if (!ready || event.ctrlKey || event.metaKey) return;
-  if (event.key === '+' || event.key === '-' || event.key === '=') {
-    event.preventDefault();
-    applyChange(() => setZoom(state.crops[selected].z + (event.key === '-' ? -.08 : .08)));
-  }
-  const direction = arrows[event.key];
-  if (!direction) return;
-  const bounds = activeCropBounds();
-  if (!bounds) return;
-  event.preventDefault();
-  const [dx, dy] = direction;
-  const step = event.shiftKey ? .06 : .015;
-  applyChange(() => {
-    const crop = state.crops[selected];
-    crop.x = clamp(crop.x + dx * step, -bounds.mx, bounds.mx);
-    crop.y = clamp(crop.y + dy * step, -bounds.my, bounds.my);
-  });
+// Keyboard shortcut manager integration
+const shortcuts = createShortcutManager();
+
+shortcuts.register('Ctrl+z', () => {
+  historyStore.undo();
+  refresh();
+});
+shortcuts.register('Ctrl+Shift+z', () => {
+  historyStore.redo();
+  refresh();
+});
+shortcuts.register('Ctrl+y', () => {
+  historyStore.redo();
+  refresh();
+});
+shortcuts.register('+', () => {
+  const state = historyStore.getState();
+  const crop = state.crops[selected];
+  if (crop) setZoom(crop.z + 0.08);
+});
+shortcuts.register('-', () => {
+  const state = historyStore.getState();
+  const crop = state.crops[selected];
+  if (crop) setZoom(crop.z - 0.08);
+});
+shortcuts.register('=', () => {
+  const state = historyStore.getState();
+  const crop = state.crops[selected];
+  if (crop) setZoom(crop.z + 0.08);
 });
 
+const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+for (const arrow of Object.keys(arrows)) {
+  shortcuts.register(arrow, event => {
+    const bounds = activeCropBounds();
+    if (!bounds) return;
+    event.preventDefault();
+    const [dx, dy] = arrows[arrow];
+    const step = event.shiftKey ? .06 : .015;
+    applyChange(state => {
+      const crop = state.crops[selected];
+      if (crop) {
+        const newOffsets = calculateKeyboardPan(crop, bounds, dx, dy, step);
+        crop.x = newOffsets.x;
+        crop.y = newOffsets.y;
+      }
+    });
+  });
+}
+
 document.addEventListener('keydown', event => {
-  if (!(event.ctrlKey || event.metaKey) || !['z', 'y'].includes(event.key.toLowerCase())) return;
-  if (event.target.matches('input[type="text"], textarea, [contenteditable]')) return;
-  event.preventDefault();
-  (event.shiftKey || event.key.toLowerCase() === 'y') ? travel(redo, undo) : travel(undo, redo);
+  shortcuts.handle(event);
 });
 
 byId('export').addEventListener('click', () => {
+  const exportState = structuredClone(historyStore.getState());
   const output = document.createElement('canvas');
-  paintPoster(output, state, photos);
-  const { width, height } = output;
-  output.toBlob(blob => {
-    if (!blob) {
-      byId('status').textContent = 'Could not save the PNG. Try exporting again.';
-      return;
-    }
-    const link = document.createElement('a');
-    const url = URL.createObjectURL(blob);
-    link.href = url;
-    link.download = `coastline-${width}x${height}.png`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30_000);
-    byId('status').textContent = `Exported PNG at ${width} × ${height} px.`;
-  }, 'image/png');
+  try {
+    paintPoster(output, exportState, photos);
+    const [width, height] = sizes[exportState.size];
+    output.toBlob(blob => {
+      if (!blob) {
+        byId('status').textContent = 'Could not save the PNG. Try exporting again.';
+        return;
+      }
+      const link = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      link.href = url;
+      link.download = `coastline-${width}x${height}.png`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      byId('status').textContent = `Exported PNG at ${width} × ${height} px.`;
+    }, 'image/png');
+  } catch (err) {
+    byId('status').textContent = 'Could not save the PNG. Try exporting again.';
+  }
 });
 
 const fontLoads = [
@@ -403,15 +518,32 @@ const fontLoads = [
   document.fonts.load('100px Yellowtail'),
 ];
 
-const results = await Promise.allSettled(samples.map(([src, name]) => readPhoto(`samples/${src}.jpg`, name)));
+const results = await Promise.allSettled(samples.map(async ([src, name]) => {
+  const response = await fetch(`samples/${src}.jpg`);
+  const arrayBuffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  const mime = 'image/jpeg';
+  const blob = new Blob([bytes], { type: mime });
+  const objectUrl = URL.createObjectURL(blob);
+  const image = new Image();
+  await new Promise((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = reject;
+    image.src = objectUrl;
+  });
+  return { image, name, bytes, mime };
+}));
+
 let missingSamples = 0;
 results.forEach((result, i) => {
   if (result.status === 'fulfilled') {
     const index = photos.length;
     addPhoto(result.value);
+    const state = historyStore.getState();
     if (i < state.crops.length) state.crops[i].photo = index;
   } else {
     missingSamples += 1;
+    const state = historyStore.getState();
     if (i < state.crops.length) state.crops[i].photo = 0;
   }
 });

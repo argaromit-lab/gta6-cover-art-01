@@ -287,17 +287,20 @@ output { min-width: 45px; text-align: right; color: var(--coral-soft); font-size
   .preview-foot { flex-direction: row; align-items: center; flex-wrap: wrap; }
   .filmstrip button { flex-basis: 93px; }
   .inspector-group { padding: 15px; }
+  .actions { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .quiet { padding: 6px 8px; font-size: 11px; }
 }
 @media (max-width: 400px) {
-  .brand img { width: 29px; height: 29px; }
-  .brand { gap: 7px; }
-  h1 { font-size: 23px; }
-  .brand p { font-size: 11px; }
-  .actions { gap: 4px; }
+  .brand img { width: 26px; height: 26px; }
+  .brand { gap: 5px; }
+  h1 { font-size: 19px; }
+  .brand p { font-size: 10px; }
+  .actions { gap: 3px; flex-wrap: wrap; justify-content: flex-end; }
   .history { gap: 1px; }
-  .icon-button { width: 29px; min-height: 36px; }
-  .primary { padding: 9px 7px; font-size: 12px; }
-  .primary svg { width: 14px; height: 14px; }
-  .mast { padding-inline: 10px; gap: 5px; }
-  .workspace { padding-inline: 10px; }
+  .icon-button { width: 27px; min-height: 32px; }
+  .quiet { padding: 4px 5px; font-size: 10px; }
+  .primary { padding: 7px 5px; font-size: 11px; }
+  .primary svg { width: 13px; height: 13px; }
+  .mast { padding-inline: 6px; gap: 4px; }
+  .workspace { padding-inline: 6px; }
 }

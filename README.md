@@ -4,10 +4,11 @@
 [![rank](https://make.fun/badge/gta6-cover-art-01/argaromit-lab/gta6-cover-art-01/rank.svg)](https://make.fun/bounty/gta6-cover-art-01)
 [![reward](https://make.fun/badge/gta6-cover-art-01/argaromit-lab/gta6-cover-art-01/reward.svg)](https://make.fun/bounty/gta6-cover-art-01)
 
-An offline, multi-panel photo cover editor with per-panel scene labels, 'Fill all panels', 'Clear lettering', a custom title plate, original poster lettering, and sunset or neon color grades. Photos stay entirely on your device.
+An offline, multi-panel photo cover editor with project save/load support, per-panel scene labels, 'Fill all panels', 'Clear lettering', a custom title plate, original poster lettering, and sunset or neon color grades. Photos stay entirely on your device.
 
 ## New Features & Capabilities
 
+- **Project Save & Open**: Portable JSON project export and import that embed referenced photo data as data URLs and validated editor state. Complete schema and asset validation ensures malformed imports never damage active projects, supporting secure local-only operation.
 - **Fill all panels**: Apply the selected panel's photo and crop/label to every active panel as a single undoable action.
 - **Per-panel Scene Labels**: Editable scene label field for the selected panel stored in state, surviving crop changes, following undo/redo, and rendering clipped to actual panel paths in PNG exports.
 - **Show Scene Labels Toggle**: Privacy-first toggle (OFF by default) to display or hide scene labels. Local filenames never appear on exported art unless explicitly enabled.
@@ -23,7 +24,7 @@ Serve `app/` with any static HTTP server, for example:
 python -m http.server 8080 --directory app
 ```
 
-Open `http://localhost:8080`, choose a panel, assign a photo, drag to crop, edit scene labels, and export a PNG.
+Open `http://localhost:8080`, choose a panel, assign a photo, drag to crop, edit scene labels, save/open projects, and export a PNG.
 
 ## Files
 
