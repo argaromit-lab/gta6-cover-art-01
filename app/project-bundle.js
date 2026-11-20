@@ -1,4 +1,5 @@
 import { validateState } from './project-state.js';
+import { decodePhotoBlob, validateDimensions, disposePhotoResource } from './photo-resources.js';
 
 export const PROJECT_VERSION = 2;
 export const MAX_PROJECT_BYTES = 40 * 1024 * 1024; // 40 MB
@@ -142,11 +143,14 @@ export async function serializeProject(state, photos) {
       if (bytes.length > MAX_PHOTO_BYTES) throw new Error('Photo exceeds maximum size limit (10 MB)');
       const val = validateMagicBytes(bytes, mime);
       if (!val.valid) throw new Error(`Asset magic validation failed: ${val.error}`);
+      const tempRes = await decodePhotoBlob(bytes, mime, p.name);
+      tempRes.dispose();
     } else if (p.image) {
       const width = p.image.naturalWidth || p.image.width || 0;
       const height = p.image.naturalHeight || p.image.height || 0;
-      if (!width || !height || width > MAX_DIMENSION || height > MAX_DIMENSION || (width * height) > MAX_PIXELS) {
-        throw new Error('Image dimensions exceed allowed limits');
+      const dimVal = validateDimensions(width, height);
+      if (!dimVal.valid) {
+        throw new Error(dimVal.error);
       }
       const c = document.createElement('canvas');
       c.width = width;
@@ -203,7 +207,7 @@ export async function serializeProject(state, photos) {
  * Asynchronously imports, validates, and decodes a project JSON bundle (schema v1 or v2).
  */
 export async function importProjectJson(jsonText) {
-  const objectUrlsToRevoke = [];
+  const decodedPhotos = [];
   try {
     if (typeof jsonText !== 'string') {
       return { success: false, error: 'Project text must be a string' };
@@ -228,8 +232,6 @@ export async function importProjectJson(jsonText) {
     if (typeof version !== 'number' || (version !== 1 && version !== 2)) {
       return { success: false, error: `Unsupported project version: ${version}` };
     }
-
-    const decodedPhotos = [];
 
     if (version === 2) {
       if (project.type !== 'coastline-project-bundle') {
@@ -305,33 +307,8 @@ export async function importProjectJson(jsonText) {
 
       for (const p of project.photos) {
         const asset = assetMap.get(p.hash);
-        const blob = new Blob([asset.bytes], { type: asset.mime });
-        const src = URL.createObjectURL(blob);
-        objectUrlsToRevoke.push(src);
-
-        const image = new Image();
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Image decode timed out')), 10000));
-        await Promise.race([
-          new Promise((resolve, reject) => {
-            image.onload = () => resolve();
-            image.onerror = () => reject(new Error('Failed to decode image asset'));
-            image.src = src;
-          }),
-          timeoutPromise
-        ]);
-
-        const width = image.naturalWidth || image.width;
-        const height = image.naturalHeight || image.height;
-        if (!width || !height || width > MAX_DIMENSION || height > MAX_DIMENSION || (width * height) > MAX_PIXELS) {
-          throw new Error('Image dimensions exceed allowed limits (max 8192px, max 32MP)');
-        }
-
-        decodedPhotos.push({
-          image,
-          name: String(p.name).slice(0, 80),
-          bytes: asset.bytes,
-          mime: asset.mime
-        });
+        const resource = await decodePhotoBlob(asset.bytes, asset.mime, p.name);
+        decodedPhotos.push(resource);
       }
 
       return { success: true, state: validatedState, photos: decodedPhotos };
@@ -356,33 +333,8 @@ export async function importProjectJson(jsonText) {
         }
 
         const bytes = base64ToUint8Array(p.dataUrl.split(',')[1]);
-        const blob = new Blob([bytes], { type: val.mime });
-        const src = URL.createObjectURL(blob);
-        objectUrlsToRevoke.push(src);
-
-        const image = new Image();
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Image decode timed out')), 10000));
-        await Promise.race([
-          new Promise((resolve, reject) => {
-            image.onload = () => resolve();
-            image.onerror = () => reject(new Error('Failed to load image from data URL'));
-            image.src = src;
-          }),
-          timeoutPromise
-        ]);
-
-        const width = image.naturalWidth || image.width;
-        const height = image.naturalHeight || image.height;
-        if (!width || !height || width > MAX_DIMENSION || height > MAX_DIMENSION || (width * height) > MAX_PIXELS) {
-          throw new Error('Invalid or oversized image dimensions');
-        }
-
-        decodedPhotos.push({
-          image,
-          name: String(p.name || 'Photo').slice(0, 80),
-          bytes,
-          mime: val.mime
-        });
+        const resource = await decodePhotoBlob(bytes, val.mime, p.name || 'Photo');
+        decodedPhotos.push(resource);
       }
 
       return { success: true, state: validatedState, photos: decodedPhotos };
@@ -392,8 +344,8 @@ export async function importProjectJson(jsonText) {
     }
 
   } catch (err) {
-    for (const url of objectUrlsToRevoke) {
-      try { URL.revokeObjectURL(url); } catch (e) {}
+    for (const p of decodedPhotos) {
+      try { disposePhotoResource(p); } catch (e) {}
     }
     return { success: false, error: err instanceof Error ? err.message : String(err) };
   }

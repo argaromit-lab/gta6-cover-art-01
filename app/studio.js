@@ -3,6 +3,7 @@ import { defaultState, validateState, createHistoryStore, freshCrop } from './pr
 import { serializeProject, importProjectJson, sanitizeFilename } from './project-archive.js';
 import { calculateZoom, clampCropOffsets, calculatePointerPan, calculateKeyboardPan } from './crop-geometry.js';
 import { createShortcutManager } from './editor-shortcuts.js';
+import { decodePhotoBlob, disposePhotoResource } from './photo-resources.js';
 
 const byId = id => document.getElementById(id);
 const canvas = byId('cover');
@@ -135,16 +136,8 @@ async function addFiles(files) {
       const arrayBuffer = await file.arrayBuffer();
       const bytes = new Uint8Array(arrayBuffer);
       const mime = file.type || 'image/jpeg';
-      const blob = new Blob([bytes], { type: mime });
-      const src = URL.createObjectURL(blob);
-      const name = file.name.replace(/\.[^.]+$/, '') || 'New photo';
-      const image = new Image();
-      await new Promise((resolve, reject) => {
-        image.onload = () => resolve();
-        image.onerror = () => reject(new Error('Failed to load image'));
-        image.src = src;
-      });
-      decoded.push({ image, name, bytes, mime });
+      const resource = await decodePhotoBlob(bytes, mime, file.name.replace(/\.[^.]+$/, '') || 'New photo');
+      decoded.push(resource);
     } catch {
       skipped += 1;
     }
@@ -332,6 +325,7 @@ byId('import-project').addEventListener('change', async event => {
 
     photos.forEach(p => {
       if (p.button) p.button.remove();
+      if (typeof p.dispose === 'function') p.dispose();
     });
     photos.length = 0;
     result.photos.forEach(p => addPhoto(p));
@@ -523,15 +517,7 @@ const results = await Promise.allSettled(samples.map(async ([src, name]) => {
   const arrayBuffer = await response.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
   const mime = 'image/jpeg';
-  const blob = new Blob([bytes], { type: mime });
-  const objectUrl = URL.createObjectURL(blob);
-  const image = new Image();
-  await new Promise((resolve, reject) => {
-    image.onload = () => resolve();
-    image.onerror = reject;
-    image.src = objectUrl;
-  });
-  return { image, name, bytes, mime };
+  return await decodePhotoBlob(bytes, mime, name);
 }));
 
 let missingSamples = 0;
